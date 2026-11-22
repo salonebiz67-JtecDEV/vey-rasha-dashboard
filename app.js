@@ -308,4 +308,194 @@
       const vs = currentVariants();
       if (!vs.length) { gridBox.replaceChildren(h('p', { class: 'muted small' }, 'Add at least one size and one colour to set stock.')); return; }
       gridBox.replaceChildren(h('table', { class: 'vt' }, h('tr', null, h('th', null, 'Size'), h('th', null, 'Colour'), h('th', null, 'Stock')),
-        vs.map((v) => { const k = v.size + '|' + v.color_name; return h('
+        vs.map((v) => { const k = v.size + '|' + v.color_name; return h('tr', null, h('td', null, v.size), h('td', null, v.color_name),
+          h('td', null, h('input', { type: 'number', min: 0, max: 9999, inputmode: 'numeric', value: stock.has(k) ? stock.get(k) : 1, oninput: (e) => stock.set(k, Math.max(0, parseInt(e.target.value || '0', 10) || 0)) }))); })));
+      vs.forEach((v) => { const k = v.size + '|' + v.color_name; if (!stock.has(k)) stock.set(k, 1); });
+    }
+    f.sizes.addEventListener('input', drawGrid);
+
+    const saveBtn = h('button', { class: 'btn primary', type: 'button' }, isNew ? 'Post product' : 'Save changes');
+    saveBtn.addEventListener('click', async () => {
+      const name = f.name.value.trim(), price = Number(f.price.value), variants = currentVariants();
+      if (!name) return toast('Please enter a product name.', true);
+      if (!Number.isFinite(price) || price < 0) return toast('Please enter a valid price.', true);
+      if (f.pub.checked && !variants.length) return toast('Add sizes and colours before making it live.', true);
+      if (f.pub.checked && !images.length) return toast('Add at least one photo before making it live.', true);
+      saveBtn.disabled = true; saveBtn.textContent = 'Saving…';
+      try {
+        await saveProduct(p, {
+          name, subtitle: f.subtitle.value.trim(), category: f.category.value, price, description: f.desc.value.trim(),
+          material: f.material.value.trim(), care: f.care.value.trim(), isNew: f.isNew.checked, isBest: f.isBest.checked, pub: f.pub.checked,
+        }, images, removed, variants.map((v) => ({ ...v, stock_count: stock.get(v.size + '|' + v.color_name) ?? 0 })));
+        closeSheet(); await loadProducts(); render(); toast(isNew ? 'Product posted ✔' : 'Saved ✔');
+      } catch (e) { fail(e, 'Saving product'); saveBtn.disabled = false; saveBtn.textContent = isNew ? 'Post product' : 'Save changes'; }
+    });
+
+    const field = (t, el) => [h('label', { class: 'f' }, t), el];
+    const check = (t, el) => h('label', { class: 'row', style: 'margin:8px 0' }, el, h('span', null, t));
+    openSheet(isNew ? 'New product' : 'Edit product', h('div', null,
+      field('Name', f.name), field('Subtitle (optional)', f.subtitle), field('Category', f.category), field('Price (USD)', f.price),
+      field('Description', f.desc), field('Material', f.material), field('Care', f.care),
+      h('label', { class: 'f' }, 'Photos'), imgBox, h('div', { class: 'sp' }), fileInput,
+      field('Sizes (comma separated)', f.sizes), h('label', { class: 'f' }, 'Colours'), colorBox,
+      h('button', { class: 'btn sm', type: 'button', onclick: () => { colors.push({ name: '', hex: '#D8C3A5' }); drawColors(); } }, '+ Add colour'),
+      h('label', { class: 'f' }, 'Stock per size & colour'), gridBox, h('hr'),
+      check('New arrival', f.isNew), check('Best seller', f.isBest), check('Live in the shop (visible to customers)', f.pub), h('div', { class: 'sp' }),
+      h('div', { class: 'row wrap' }, saveBtn,
+        !isNew ? h('button', { class: 'btn danger', type: 'button', onclick: () => deleteProduct(p) }, 'Delete') : null)));
+    drawImages(); drawColors(); drawGrid();
+  }
+
+  async function saveProduct(existing, v, images, removed, variants) {
+    const row = {
+      name: v.name, subtitle: v.subtitle, category_slug: v.category, category_label: (CATEGORIES.find((c) => c[0] === v.category) || [])[1] || 'Collection',
+      description: v.description, material: v.material, care: v.care, price_usd: v.price, is_new_arrival: v.isNew, is_best_seller: v.isBest,
+    };
+    const uploaded = [];
+    let id = existing?.id;
+    try {
+      if (!existing) {
+        const { data, error } = await sb.from('products').insert({ ...row, slug: slugify(v.name) + '-' + Math.random().toString(36).slice(2, 7), is_published: false }).select('id').single();
+        if (error) throw error; id = data.id;
+      } else {
+        const { error } = await sb.from('products').update(row).eq('id', id); if (error) throw error;
+      }
+      // remove deleted photos
+      if (removed.length) {
+        const { error } = await sb.from('product_images').delete().in('id', removed.map((r) => r.id)); if (error) throw error;
+        await sb.storage.from(BUCKET).remove(removed.map((r) => r.path));
+      }
+      // upload new photos
+      for (const im of images) {
+        if (!im.file) continue;
+        const { blob, type } = await resizeImage(im.file);
+        const path = `products/${id}/${crypto.randomUUID()}.${type === 'image/webp' ? 'webp' : 'png'}`;
+        const { error } = await sb.storage.from(BUCKET).upload(path, blob, { contentType: type, cacheControl: '31536000', upsert: false });
+        if (error) throw error; uploaded.push(path);
+        const ins = await sb.from('product_images').insert({ product_id: id, storage_path: path, alt_text: v.name, sort_order: 0, is_primary: false, mime_type: type, size_bytes: blob.size }).select('id').single();
+        if (ins.error) throw ins.error; im.id = ins.data.id; im.path = path;
+      }
+      // order + cover
+      for (let i = 0; i < images.length; i++) {
+        const { error } = await sb.from('product_images').update({ sort_order: i, is_primary: i === 0 }).eq('id', images[i].id); if (error) throw error;
+      }
+      // variants
+      const keep = new Set(variants.map((x) => x.size + '|' + x.color_name));
+      const old = existing?.product_variants || [];
+      const drop = old.filter((o) => !keep.has(o.size + '|' + o.color_name)).map((o) => o.id);
+      if (drop.length) { const { error } = await sb.from('product_variants').delete().in('id', drop); if (error) throw error; }
+      if (variants.length) {
+        const { error } = await sb.from('product_variants').upsert(variants.map((x) => ({ product_id: id, size: x.size, color_name: x.color_name, color_hex: x.color_hex, stock_count: x.stock_count, is_available: true })), { onConflict: 'product_id,size,color_name' });
+        if (error) throw error;
+      }
+      const { error } = await sb.from('products').update({ is_published: v.pub }).eq('id', id); if (error) throw error;
+    } catch (e) {
+      if (!existing && id) { // roll back a half-created product
+        await sb.from('products').delete().eq('id', id);
+        if (uploaded.length) await sb.storage.from(BUCKET).remove(uploaded);
+      }
+      throw e;
+    }
+  }
+
+  async function deleteProduct(p) {
+    if (!confirm('Delete “' + p.name + '” permanently? Past orders keep their saved details.')) return;
+    try {
+      const paths = (p.product_images || []).map((i) => i.storage_path); if (paths.length) await sb.storage.from(BUCKET).remove(paths);
+      const { error } = await sb.from('products').delete().eq('id', p.id); if (error) throw error;
+      closeSheet(); await loadProducts(); render(); toast('Product deleted');
+    } catch (e) { fail(e, 'Deleting product'); }
+  }
+
+  /* ---------- orders ---------- */
+  const statusClass = (s) => (s === 'DELIVERED' ? 'ok' : s === 'CANCELLED' ? 'bad' : s === 'PENDING_REVIEW' ? 'warn' : '');
+  function orderRow(o) {
+    return h('div', { class: 'card item', onclick: () => openOrder(o.id) },
+      h('div', { class: 'grow' }, h('b', null, o.order_reference), h('div', { class: 'muted small' }, o.customer_full_name + ' · ' + o.customer_city + ' · ' + ago(o.created_at))),
+      h('div', { style: 'text-align:right' }, h('div', null, money.format(Number(o.final_total_usd ?? o.subtotal_usd))), h('span', { class: 'chip ' + statusClass(o.order_status) }, label(o.order_status))));
+  }
+  function viewOrders(main) {
+    const opts = ['ALL', ...ORDER_STATUSES];
+    const list = orders.filter((o) => orderFilter === 'ALL' || o.order_status === orderFilter);
+    main.replaceChildren(h('h1', null, 'Orders'), h('div', { class: 'sp' }),
+      h('div', { class: 'chips' }, opts.map((s) => h('button', { class: 'btn sm' + (orderFilter === s ? ' on' : ''), onclick: () => { orderFilter = s; render(); } }, s === 'ALL' ? 'All' : label(s)))),
+      list.length ? h('div', { class: 'list' }, list.map(orderRow)) : h('div', { class: 'card' }, h('p', { class: 'muted' }, 'No orders here.')));
+  }
+
+  function openOrder(id) {
+    const o = orders.find((x) => x.id === id); if (!o) return;
+    const items = o.order_items || [];
+    const kv = (k, v) => [h('dt', null, k), h('dd', null, v || '—')];
+    const fee = h('input', { type: 'number', min: 0, step: '0.01', inputmode: 'decimal', placeholder: 'Delivery fee (USD)', value: o.delivery_fee_usd ?? '' });
+    const eta = h('input', { type: 'text', maxlength: 120, placeholder: 'e.g. 2–3 days', value: o.estimated_delivery_time || '' });
+    const msg = h('textarea', { maxlength: 600, placeholder: 'Message to the customer (optional)' }, o.owner_message || '');
+    const sel = h('select', null, ORDER_STATUSES.map((s) => h('option', { value: s, selected: o.order_status === s }, label(s))));
+    const pay = h('select', null, PAYMENT_STATUSES.map((s) => h('option', { value: s, selected: o.payment_status === s }, label(s))));
+    const act = async (fn, ok) => { try { await fn(); await loadOrders(); closeSheet(); render(); toast(ok); } catch (e) { fail(e, 'Order update'); } };
+    const actions = o.order_status === 'PENDING_REVIEW'
+      ? h('div', null, h('h3', null, 'Review this order'), h('p', { class: 'muted small' }, 'Add the delivery fee and delivery time, then accept. The customer is notified instantly.'),
+          h('label', { class: 'f' }, 'Delivery fee (USD)'), fee, h('label', { class: 'f' }, 'Estimated delivery'), eta, h('label', { class: 'f' }, 'Message'), msg, h('div', { class: 'sp' }),
+          h('div', { class: 'row wrap' },
+            h('button', { class: 'btn primary', onclick: () => act(() => acceptOrder(o, fee.value, eta.value, msg.value), 'Order accepted ✔') }, 'Accept order'),
+            h('button', { class: 'btn danger', onclick: () => confirm('Decline and cancel this order?') && act(() => setStatus(o, 'CANCELLED', eta.value, msg.value), 'Order cancelled') }, 'Decline')))
+      : h('div', null, h('h3', null, 'Update progress'), h('label', { class: 'f' }, 'Status'), sel, h('label', { class: 'f' }, 'Estimated delivery'), eta, h('label', { class: 'f' }, 'Message to customer'), msg, h('div', { class: 'sp' }),
+          h('button', { class: 'btn primary', onclick: () => act(() => setStatus(o, sel.value, eta.value, msg.value), 'Status updated ✔') }, 'Update & notify customer'));
+    openSheet(o.order_reference, h('div', null,
+      h('div', { class: 'row wrap' }, h('span', { class: 'chip ' + statusClass(o.order_status) }, label(o.order_status)), h('span', { class: 'chip' }, 'Payment: ' + label(o.payment_status)), h('span', { class: 'muted small' }, ago(o.created_at))),
+      h('div', { class: 'sp' }),
+      h('dl', { class: 'kv' }, kv('Customer', o.customer_full_name), kv('Phone', o.customer_phone), kv('Address', [o.customer_delivery_address, o.customer_area, o.customer_city, o.customer_country].filter(Boolean).join(', ')),
+        kv('Instructions', o.customer_delivery_instructions), kv('Gift wrap', o.gift_presentation ? 'Yes' : 'No')),
+      h('hr'), h('h3', null, 'Items'), h('div', { class: 'sp' }),
+      h('div', { class: 'list' }, items.map((it) => h('div', { class: 'row spread' },
+        h('div', { class: 'grow' }, h('b', null, it.product_name_snapshot), h('div', { class: 'muted small' }, it.size_snapshot + ' · ' + it.color_name_snapshot + ' · ×' + it.quantity)),
+        h('div', null, money.format(Number(it.line_total_usd)))))),
+      h('hr'),
+      h('dl', { class: 'kv' }, kv('Subtotal', money.format(Number(o.subtotal_usd))), kv('Delivery', o.delivery_fee_usd == null ? 'Not set' : money.format(Number(o.delivery_fee_usd))),
+        kv('Total', o.final_total_usd == null ? 'Pending your review' : money.format(Number(o.final_total_usd)))),
+      h('hr'), actions, h('hr'),
+      h('h3', null, 'Payment'), h('label', { class: 'f' }, 'Payment status'), pay, h('div', { class: 'sp' }),
+      h('button', { class: 'btn', onclick: () => act(async () => { const { error } = await sb.from('orders').update({ payment_status: pay.value }).eq('id', o.id); if (error) throw error; }, 'Payment updated ✔') }, 'Save payment status')));
+  }
+
+  async function notifyCustomer(o, type, typeLabel, title, message, extra) {
+    const { error } = await sb.from('notifications').insert({ user_id: o.user_id, target_role: 'customer', order_id: o.id, order_reference: o.order_reference, type, type_label: typeLabel,
+      title, message, is_read: false, action_route: 'account', currency_code: o.currency_at_order, ...extra });
+    if (error) throw error;
+  }
+  async function acceptOrder(o, feeRaw, eta, msg) {
+    const fee = Number(feeRaw);
+    if (feeRaw === '' || !Number.isFinite(fee) || fee < 0) throw new Error('Enter a delivery fee of 0 or more.');
+    const f2 = Number(fee.toFixed(2)), total = Number((Number(o.subtotal_usd) + f2).toFixed(2));
+    const { data, error } = await sb.from('orders').update({ order_status: 'CONFIRMED', delivery_fee_usd: f2, final_total_usd: total,
+      estimated_delivery_time: eta.trim() || null, owner_message: msg.trim() || null, confirmed_at: o.confirmed_at || new Date().toISOString() })
+      .eq('id', o.id).eq('order_status', 'PENDING_REVIEW').select('id');
+    if (error) throw error; if (!data || !data.length) throw new Error('This order was already handled. Refresh and try again.');
+    await notifyCustomer(o, 'order_update', 'Order Update', 'Order Confirmed — ' + o.order_reference,
+      msg.trim() || 'VEY RASHA has accepted your order and confirmed your delivery fee and final order total.',
+      { confirmed_delivery_fee_usd: f2, confirmed_final_total_usd: total, estimated_delivery_time: eta.trim() || null });
+  }
+  async function setStatus(o, status, eta, msg) {
+    if (!ORDER_STATUSES.includes(status)) throw new Error('Invalid status.');
+    const { data, error } = await sb.from('orders').update({ order_status: status, owner_message: msg.trim() || null, estimated_delivery_time: eta.trim() || null,
+      confirmed_at: status !== 'PENDING_REVIEW' && status !== 'CANCELLED' && !o.confirmed_at ? new Date().toISOString() : o.confirmed_at }).eq('id', o.id).select('*').single();
+    if (error) throw error;
+    const milestone = ['READY_FOR_DISPATCH', 'SHIPPED', 'DELIVERED'].includes(status);
+    await notifyCustomer(o, milestone ? 'delivery_update' : 'order_update', milestone ? 'Delivery Update' : 'Order Update',
+      'Order ' + status.replace(/_/g, ' ') + ' — ' + o.order_reference,
+      msg.trim() || 'Your order status has been updated to ' + label(status).toLowerCase() + '.',
+      { confirmed_delivery_fee_usd: data.delivery_fee_usd, confirmed_final_total_usd: data.final_total_usd, estimated_delivery_time: data.estimated_delivery_time });
+  }
+
+  /* ---------- alerts ---------- */
+  function viewAlerts(main) {
+    main.replaceChildren(h('div', { class: 'row spread' }, h('h1', null, 'Alerts'),
+      unread() ? h('button', { class: 'btn sm', onclick: async () => { const { error } = await sb.from('notifications').update({ is_read: true }).eq('target_role', 'owner').eq('is_read', false); if (error) return fail(error, 'Marking read'); await loadAlerts(); render(); } }, 'Mark all read') : null),
+      h('div', { class: 'sp' }),
+      alerts.length ? h('div', { class: 'list' }, alerts.map((a) => h('div', { class: 'card item', onclick: () => { if (a.order_id) openOrder(a.order_id); } },
+        h('div', { class: 'grow' }, h('b', null, a.title), h('div', { class: 'muted small' }, a.message), h('div', { class: 'muted small' }, ago(a.created_at))),
+        a.is_read ? null : h('span', { class: 'badge' }, 'new'))))
+        : h('div', { class: 'card' }, h('p', { class: 'muted' }, 'No alerts yet. New order requests will appear here instantly.')));
+  }
+
+  boot().catch((e) => fail(e, 'Startup'));
+})();
